@@ -118,6 +118,7 @@ workflows:
   # ---- Timed compile benchmark -------------------------------------------
   xcodebenchmark-m4:
     name: XcodeBenchmark M4
+    instance_type: mac_mini_m4
     max_build_duration: 30
     environment: *env
     scripts:
@@ -130,6 +131,7 @@ workflows:
 
   xcodebenchmark-m4-pro:
     name: XcodeBenchmark M4 Pro
+    instance_type: mac_pro
     max_build_duration: 30
     environment: *env
     scripts:
@@ -143,6 +145,7 @@ workflows:
   # ---- Hardware microbenchmarks (run separately from the compile benchmark) ----
   hwbaseline-m4:
     name: HW baseline M4
+    instance_type: mac_mini_m4
     max_build_duration: 20
     environment: *env
     scripts:
@@ -152,6 +155,7 @@ workflows:
 
   hwbaseline-m4-pro:
     name: HW baseline M4 Pro
+    instance_type: mac_pro
     max_build_duration: 20
     environment: *env
     scripts:
