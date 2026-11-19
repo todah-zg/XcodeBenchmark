@@ -6,8 +6,13 @@
 #   hwbaseline-*       disk + memory-bandwidth microbenchmarks. Run these separately,
 #                      never during a benchmark build.
 #
-# Run each xcodebenchmark workflow 3x per machine, one build at a time, and compare medians.
-# Same Xcode on every machine is what makes the comparison valid.
+# Machine selection: the M4 workflows pin instance_type: mac_mini_m4. The M4 Pro workflows
+# have NO instance_type on purpose: they run on the team's default machine, which is switched
+# manually in team settings before running them. Always confirm the chip in the
+# "Environment info" step of each build log.
+#
+# Run each xcodebenchmark workflow 5x per machine, one build at a time, and compare the
+# median and the minimum. Same Xcode on every machine is what makes the comparison valid.
 
 definitions:
   env: &env
@@ -23,7 +28,8 @@ definitions:
       system_profiler SPHardwareDataType | grep -E "Model Name|Model Identifier|Chip|Total Number of Cores|Memory"
       df -h / | tail -1
 
-  # Starts a very low-rate sampler (every 10 s) so thermal throttling or swapping shows up in the artifact.
+  # Starts a very low-rate sampler (every 10 s). Note: inside the virtual machines thermal
+  # data is not exposed (pmset prints nothing), so only swap/memory pressure are informative.
   sampler_start: &sampler_start
     name: Start light sampler
     script: |
@@ -32,7 +38,7 @@ definitions:
         while true; do
           {
             echo "=== $(date +%T)"
-            pmset -g therm 2>/dev/null | grep -iE "speed_limit|cpu_scheduler|thermal"
+            pmset -g therm 2>/dev/null | grep -iE "speed_limit|cpu_scheduler|thermal" 
             sysctl vm.swapusage
             memory_pressure -Q 2>/dev/null | grep -i "free percentage"
           } >> "$CM_BUILD_DIR/bench_out/samples.log"
@@ -61,7 +67,7 @@ definitions:
       echo "--- throttling / swap samples (look for speed_limit < 100 or swap growth) ---"
       grep -hE "speed_limit|swapusage" "$CM_BUILD_DIR/bench_out/samples.log" | sort | uniq -c | sort -rn | head
 
-  # Disk: sequential write/read with dd, plus random I/O if fio is installed.
+  # Disk: sequential write/read with dd, then random 4K read/write mix with fio.
   disk_step: &disk_step
     name: Disk speed
     script: |
@@ -73,15 +79,21 @@ definitions:
       echo "Sequential read 4 GiB"
       dd if="$F" of=/dev/null bs=1m 2>&1 | tail -1
       rm -f "$F"
+
+      echo "Random 4K I/O (fio)"
+      export HOMEBREW_NO_AUTO_UPDATE=1
+      command -v fio >/dev/null || brew install fio || echo "fio install failed"
       if command -v fio >/dev/null; then
-        fio --name=randrw --filename="$HOME/fio.bin" --size=2G --bs=4k --rw=randrw --iodepth=32 \
-            --ioengine=posixaio --runtime=20 --time_based --group_reporting
+        fio --name=randrw --filename="$HOME/fio.bin" --size=4G --bs=4k --rw=randrw --rwmixread=70 \
+            --iodepth=32 --direct=1 --ioengine=posixaio --runtime=30 --time_based --group_reporting \
+          || echo "fio run failed (not fatal)"
         rm -f "$HOME/fio.bin"
       else
-        echo "fio not installed: skipping random I/O (brew install fio to add it)"
+        echo "fio not available: skipping random I/O"
       fi
 
-  # Memory bandwidth: small multithreaded triad kernel compiled inline (no downloads).
+  # Memory bandwidth: multithreaded triad kernel compiled inline (no downloads).
+  # One untimed warm-up trial, then 5 timed trials; the best one is reported.
   membw_step: &membw_step
     name: Memory bandwidth
     script: |
@@ -91,28 +103,59 @@ definitions:
       #include <pthread.h>
       #include <time.h>
       #include <unistd.h>
-      #define N (32*1024*1024)   // doubles per array per thread (256 MiB), far above any cache
-      #define REPS 20
-      static void *work(void *p){
-        double *a=malloc(N*8),*b=malloc(N*8),*c=malloc(N*8);
-        for(long i=0;i<N;i++){a[i]=0;b[i]=1;c[i]=2;}
-        for(int r=0;r<REPS;r++) for(long i=0;i<N;i++) a[i]=b[i]+3.0*c[i];
-        *(double*)p=a[N/2]; return 0;
+      #define N (16*1024*1024)   /* doubles per array per thread (128 MiB), far above any cache */
+      #define INNER 5
+      #define TRIALS 6           /* trial 0 is the warm-up */
+      static int nt;
+      static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+      static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+      static int arrived = 0, gen = 0;
+      static double best = 0, t0;
+      static void barrier(void) {
+        pthread_mutex_lock(&m);
+        int g = gen;
+        if (++arrived == nt) { arrived = 0; gen++; pthread_cond_broadcast(&cv); }
+        else while (g == gen) pthread_cond_wait(&cv, &m);
+        pthread_mutex_unlock(&m);
       }
-      int main(void){
-        int nt=(int)sysconf(_SC_NPROCESSORS_ONLN); pthread_t t[64]; double s[64];
-        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-        for(int i=0;i<nt;i++) pthread_create(&t[i],0,work,&s[i]);
-        for(int i=0;i<nt;i++) pthread_join(t[i],0);
-        clock_gettime(CLOCK_MONOTONIC,&t1);
-        double sec=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
-        printf("threads=%d triad bandwidth ~ %.1f GB/s (includes init pass)\n",nt,
-               (double)nt*REPS*N*24.0/sec/1e9);
+      static double now(void) {
+        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+        return t.tv_sec + t.tv_nsec / 1e9;
+      }
+      static void *work(void *arg) {
+        long id = (long)arg;
+        double *a = malloc(N * 8), *b = malloc(N * 8), *c = malloc(N * 8);
+        for (long i = 0; i < N; i++) { a[i] = 0; b[i] = 1; c[i] = 2; }
+        for (int t = 0; t < TRIALS; t++) {
+          barrier();
+          if (id == 0) t0 = now();
+          for (int r = 0; r < INNER; r++) {
+            double s = 3.0 + r;
+            for (long i = 0; i < N; i++) a[i] = b[i] + s * c[i];
+          }
+          barrier();
+          if (id == 0) {
+            double sec = now() - t0;
+            double gbs = (double)nt * INNER * N * 24.0 / sec / 1e9;
+            if (t == 0) printf("warm-up : %.1f GB/s (ignored)\n", gbs);
+            else { printf("trial %d : %.1f GB/s\n", t, gbs); if (gbs > best) best = gbs; }
+          }
+        }
+        volatile double sink = a[N / 2]; (void)sink;
+        return 0;
+      }
+      int main(void) {
+        nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        pthread_t th[64];
+        if (nt > 64) nt = 64;
+        for (long i = 0; i < nt; i++) pthread_create(&th[i], 0, work, (void *)i);
+        for (int i = 0; i < nt; i++) pthread_join(th[i], 0);
+        printf("threads=%d BEST triad bandwidth ~ %.1f GB/s\n", nt, best);
         return 0;
       }
       EOF
       clang -O3 -o /tmp/membw /tmp/membw.c
-      for i in 1 2 3; do /tmp/membw; done
+      /tmp/membw
 
 workflows:
   # ---- Timed compile benchmark -------------------------------------------
@@ -129,6 +172,7 @@ workflows:
     artifacts:
       - bench_out/*
 
+  # No instance_type: runs on the team's default machine (switch the default to M4 Pro first).
   xcodebenchmark-m4-pro:
     name: XcodeBenchmark M4 Pro
     max_build_duration: 30
@@ -152,6 +196,7 @@ workflows:
       - *disk_step
       - *membw_step
 
+  # No instance_type: runs on the team's default machine (switch the default to M4 Pro first).
   hwbaseline-m4-pro:
     name: HW baseline M4 Pro
     max_build_duration: 20
