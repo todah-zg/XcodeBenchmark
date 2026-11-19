@@ -1,0 +1,164 @@
+# XcodeBenchmark on Codemagic: M4 vs M4 Pro
+#
+# Two kinds of workflows, kept apart on purpose so the extras never touch the timed build:
+#   xcodebenchmark-*   the timed compile. Only cheap wall-clock timestamps and a 10 s
+#                      background sampler (memory pressure, swap, thermal state).
+#   hwbaseline-*       disk + memory-bandwidth microbenchmarks. Run these separately,
+#                      never during a benchmark build.
+#
+# Run each xcodebenchmark workflow 3x per machine, one build at a time, and compare medians.
+# Same Xcode on every machine is what makes the comparison valid.
+
+definitions:
+  env: &env
+    xcode: 26.6   # adjust to the exact 26.6.x string the image reports if this does not resolve
+
+  info_step: &info_step
+    name: Environment info
+    script: |
+      sw_vers
+      xcodebuild -version
+      sysctl -n machdep.cpu.brand_string
+      sysctl -n hw.ncpu hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu hw.memsize 2>/dev/null
+      system_profiler SPHardwareDataType | grep -E "Model Name|Model Identifier|Chip|Total Number of Cores|Memory"
+      df -h / | tail -1
+
+  # Starts a very low-rate sampler (every 10 s) so thermal throttling or swapping shows up in the artifact.
+  sampler_start: &sampler_start
+    name: Start light sampler
+    script: |
+      mkdir -p "$CM_BUILD_DIR/bench_out"
+      (
+        while true; do
+          {
+            echo "=== $(date +%T)"
+            pmset -g therm 2>/dev/null | grep -iE "speed_limit|cpu_scheduler|thermal"
+            sysctl vm.swapusage
+            memory_pressure -Q 2>/dev/null | grep -i "free percentage"
+          } >> "$CM_BUILD_DIR/bench_out/samples.log"
+          sleep 10
+        done
+      ) &
+      echo $! > "$CM_BUILD_DIR/bench_out/sampler.pid"
+
+  benchmark_step: &benchmark_step
+    name: Run XcodeBenchmark (timed)
+    script: |
+      START=$(date +%s)
+      sh benchmark.sh 2>&1 | tee "$CM_BUILD_DIR/bench_out/benchmark.log"
+      STATUS=${PIPESTATUS[0]}
+      END=$(date +%s)
+      echo "WALL_CLOCK_SECONDS=$((END-START))" | tee "$CM_BUILD_DIR/bench_out/summary.txt"
+      exit $STATUS
+
+  sampler_stop: &sampler_stop
+    name: Stop sampler and summarize
+    ignore_failure: true
+    script: |
+      kill "$(cat "$CM_BUILD_DIR/bench_out/sampler.pid")" 2>/dev/null || true
+      echo "--- summary ---"
+      cat "$CM_BUILD_DIR/bench_out/summary.txt"
+      echo "--- throttling / swap samples (look for speed_limit < 100 or swap growth) ---"
+      grep -hE "speed_limit|swapusage" "$CM_BUILD_DIR/bench_out/samples.log" | sort | uniq -c | sort -rn | head
+
+  # Disk: sequential write/read with dd, plus random I/O if fio is installed.
+  disk_step: &disk_step
+    name: Disk speed
+    script: |
+      F="$HOME/disk_test.bin"
+      echo "Sequential write 4 GiB"
+      dd if=/dev/zero of="$F" bs=1m count=4096 2>&1 | tail -1
+      sync
+      sudo purge 2>/dev/null || echo "purge unavailable: read result may be cache-inflated"
+      echo "Sequential read 4 GiB"
+      dd if="$F" of=/dev/null bs=1m 2>&1 | tail -1
+      rm -f "$F"
+      if command -v fio >/dev/null; then
+        fio --name=randrw --filename="$HOME/fio.bin" --size=2G --bs=4k --rw=randrw --iodepth=32 \
+            --ioengine=posixaio --runtime=20 --time_based --group_reporting
+        rm -f "$HOME/fio.bin"
+      else
+        echo "fio not installed: skipping random I/O (brew install fio to add it)"
+      fi
+
+  # Memory bandwidth: small multithreaded triad kernel compiled inline (no downloads).
+  membw_step: &membw_step
+    name: Memory bandwidth
+    script: |
+      cat > /tmp/membw.c <<'EOF'
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <pthread.h>
+      #include <time.h>
+      #include <unistd.h>
+      #define N (32*1024*1024)   // doubles per array per thread (256 MiB), far above any cache
+      #define REPS 20
+      static void *work(void *p){
+        double *a=malloc(N*8),*b=malloc(N*8),*c=malloc(N*8);
+        for(long i=0;i<N;i++){a[i]=0;b[i]=1;c[i]=2;}
+        for(int r=0;r<REPS;r++) for(long i=0;i<N;i++) a[i]=b[i]+3.0*c[i];
+        *(double*)p=a[N/2]; return 0;
+      }
+      int main(void){
+        int nt=(int)sysconf(_SC_NPROCESSORS_ONLN); pthread_t t[64]; double s[64];
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        for(int i=0;i<nt;i++) pthread_create(&t[i],0,work,&s[i]);
+        for(int i=0;i<nt;i++) pthread_join(t[i],0);
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+        double sec=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
+        printf("threads=%d triad bandwidth ~ %.1f GB/s (includes init pass)\n",nt,
+               (double)nt*REPS*N*24.0/sec/1e9);
+        return 0;
+      }
+      EOF
+      clang -O3 -o /tmp/membw /tmp/membw.c
+      for i in 1 2 3; do /tmp/membw; done
+
+workflows:
+  # ---- Timed compile benchmark -------------------------------------------
+  xcodebenchmark-m4:
+    name: XcodeBenchmark M4
+    instance_type: mac_mini_m4
+    max_build_duration: 30
+    environment: *env
+    scripts:
+      - *info_step
+      - *sampler_start
+      - *benchmark_step
+      - *sampler_stop
+    artifacts:
+      - bench_out/*
+
+  xcodebenchmark-m4-pro:
+    name: XcodeBenchmark M4 Pro
+    instance_type: mac_mini_m4_pro
+    max_build_duration: 30
+    environment: *env
+    scripts:
+      - *info_step
+      - *sampler_start
+      - *benchmark_step
+      - *sampler_stop
+    artifacts:
+      - bench_out/*
+
+  # ---- Hardware microbenchmarks (run separately from the compile benchmark) ----
+  hwbaseline-m4:
+    name: HW baseline M4
+    instance_type: mac_mini_m4
+    max_build_duration: 20
+    environment: *env
+    scripts:
+      - *info_step
+      - *disk_step
+      - *membw_step
+
+  hwbaseline-m4-pro:
+    name: HW baseline M4 Pro
+    instance_type: mac_mini_m4_pro
+    max_build_duration: 20
+    environment: *env
+    scripts:
+      - *info_step
+      - *disk_step
+      - *membw_step
