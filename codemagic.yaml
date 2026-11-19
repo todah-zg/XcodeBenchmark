@@ -131,7 +131,6 @@ workflows:
 
   xcodebenchmark-m4-pro:
     name: XcodeBenchmark M4 Pro
-    instance_type: mac_pro
     max_build_duration: 30
     environment: *env
     scripts:
@@ -155,7 +154,6 @@ workflows:
 
   hwbaseline-m4-pro:
     name: HW baseline M4 Pro
-    instance_type: mac_pro
     max_build_duration: 20
     environment: *env
     scripts:
